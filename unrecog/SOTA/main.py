@@ -91,7 +91,12 @@ def plot_combined_curves(log_dict, save_path):
     plt.close()
 
 # === ATTACK FUNCTION ===
-def evolve_image_for_class(model, model_name, target_idx, mode, max_iter=MAX_ITER, early_stop_threshold=0.99):
+def evolve_image_for_class_topk(
+    model, model_name, target_idx, mode,
+    max_iter=MAX_ITER,
+    early_stop_threshold=0.99,
+    k_candidates=10
+):
     model.eval()
     base_img = create_tensor(mode)
     img = base_img.clone()
@@ -100,26 +105,44 @@ def evolve_image_for_class(model, model_name, target_idx, mode, max_iter=MAX_ITE
     best_img = img.clone()
     log_rows = []
 
+    query_count = 0
     pbar = tqdm(range(max_iter), desc=f"{model_name} | {mode} | Class {target_idx}", leave=False)
+
     for i in pbar:
-        candidate = img.clone()
-        x = random.randint(0, IMAGE_SIZE[1] - 1)
-        y = random.randint(0, IMAGE_SIZE[0] - 1)
-        ch = random.randint(0, 2)
-        candidate[0, ch, y, x] = torch.rand(1).item()
+        candidates = []
+        coords = []
 
+        # Generate K mutated candidates
+        for _ in range(k_candidates):
+            candidate = img.clone()
+            x = random.randint(0, IMAGE_SIZE[1] - 1)
+            y = random.randint(0, IMAGE_SIZE[0] - 1)
+            ch = random.randint(0, 2)
+            candidate[0, ch, y, x] = torch.rand(1).item()
+            candidates.append(candidate)
+            coords.append((x, y, ch))
+
+        batch = torch.cat(candidates, dim=0)
         with torch.no_grad():
-            probs = F.softmax(model(candidate), dim=1)
-            target_conf = probs[0, target_idx].item()
-            top_probs, top_idxs = probs.topk(3)
-            top_probs = top_probs.squeeze(0).tolist()
-            top_idxs = top_idxs.squeeze(0).tolist()
+            probs = F.softmax(model(batch), dim=1)
+            target_confs = probs[:, target_idx]
+            query_count += k_candidates
 
-        l2 = torch.norm((candidate - base_img)).item()
+        # Pick best candidate
+        best_idx = torch.argmax(target_confs).item()
+        best_candidate = candidates[best_idx]
+        best_conf_candidate = target_confs[best_idx].item()
+
+        top_probs, top_idxs = probs[best_idx].topk(3)
+        top_probs = top_probs.tolist()
+        top_idxs = top_idxs.tolist()
+
+        l2 = torch.norm((best_candidate - base_img)).item()
 
         log_rows.append({
             "iter": i,
-            "target_conf": target_conf,
+            "query_count": query_count,
+            "target_conf": best_conf_candidate,
             "l2": l2,
             "top1_label": imagenet_classes[top_idxs[0]],
             "top1_conf": top_probs[0],
@@ -129,21 +152,22 @@ def evolve_image_for_class(model, model_name, target_idx, mode, max_iter=MAX_ITE
             "top3_conf": top_probs[2],
         })
 
-        pbar.set_description(f"{model_name} | {mode} | Gen {i} | Conf: {target_conf:.4f}")
+        pbar.set_description(f"{model_name} | {mode} | Gen {i} | Conf: {best_conf_candidate:.4f}")
 
-        if target_conf > best_conf:
-            best_conf = target_conf
-            best_img = candidate.clone()
-            img = candidate
+        if best_conf_candidate > best_conf:
+            best_conf = best_conf_candidate
+            best_img = best_candidate.clone()
+            img = best_candidate  # move forward with the best one
 
-        if target_conf >= early_stop_threshold:
+        if best_conf_candidate >= early_stop_threshold:
             break
 
     return {
         "adv_img": best_img,
         "log": pd.DataFrame(log_rows),
         "success_gen": i,
-        "final_conf": best_conf
+        "final_conf": best_conf,
+        "queries_used": query_count
     }
 
 # === MAIN EXPERIMENT ===
@@ -162,7 +186,7 @@ for target_idx in tqdm(selected_indices, desc="All classes"):
 
         logs = {}
         for mode in MODES:
-            result = evolve_image_for_class(model, model_name, target_idx, mode=mode)
+            result = evolve_image_for_class_topk(model, model_name, target_idx, mode=mode)
 
             # Save directory
             save_dir = os.path.join(ROOT_DIR, mode, model_name, f"{target_idx:03d}_{target_class}")
